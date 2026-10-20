@@ -152,7 +152,7 @@ class BuildTileTest(unittest.TestCase):
     def test_build_clips_and_styles(self):
         f = features([[(-300, 50), (300, 50)], [(100, 10), (100, 200)]], ["primary", "track"])
         chunks = [c for c in roads.build_tile(FRAME, 0, 0, [f], flat) if c["m"] in {l["m"] for l in roads.LOOK.values()}]
-        self.assertEqual(len(chunks), 2, "one surface chunk per road (lines and sidewalks aside)")
+        self.assertEqual(len(chunks), 3, "the track is split at the paved road (lines and sidewalks aside)")
         prim = next(c for c in chunks if c["w"] == roads.STYLE["primary"][0] + 2 * roads.EDGE_STRIP_M)
         xs = [n[0] for n in prim["n"]]
         self.assertAlmostEqual(min(xs), -roads.OVERLAP, delta=0.05)

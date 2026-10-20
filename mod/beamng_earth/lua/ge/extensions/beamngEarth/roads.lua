@@ -203,7 +203,7 @@ function M.slotsHeld(sess)
   return out
 end
 
-local function now() return os.clock() * 1000 end
+local now = stopwatch.clock()
 
 local function dropTile(key)
   local t = tiles[key]
@@ -603,10 +603,30 @@ local function releaseGhosts(player)
   if not left then ghostSince = nil end
 end
 
+-- Collision rebuilds are heavy operations, not shape imports: their global scene cost must neither
+-- share a frame with new meshes nor teach the roadWalk estimate that every mesh costs a rebuild.
+-- Ask before creations so an urgent rebuild can reserve this frame. New colliders made below ask
+-- non-urgently at the end: the next frame may override the wait if the player is reaching them.
+local function rebuildCollision(gov, allowUrgent)
+  local urgent = collisionDirty and (holdActive or M.urgentColliders()) and sinceReload() >= M.URGENT_GAP_S * 1000
+  if not swapQuiet and ((collisionDirty and sinceReload() >= M.RELOAD_EVERY_S * 1000) or urgent
+      or (deletesDirty and sinceReload() >= M.RELOAD_DELETES_S * 1000))
+      and gov:requestHeavy(allowUrgent and urgent or false) then
+    noteNewColliders()
+    be:reloadCollision()
+    lastReloadAt = now()
+    collisionDirty, deletesDirty, sinceReload = false, false, stopwatch.new()
+  end
+end
+
 -- Once per frame (core onUpdate): deletions, then creations, within the governor's budget.
 function M.update(gov, currentAnchor, player)
   if currentAnchor then switchAnchor(currentAnchor) end
   releaseGhosts(player)
+  if swapQuiet then
+    swapQuiet.frames = swapQuiet.frames - 1
+    if swapQuiet.frames <= 0 and swapQuiet.since() >= M.SWAP_QUIET_MS then swapQuiet = nil end
+  end
   while #deleteQ > 0 and gov:try('roadDelete') do
     local t0 = now()
     local did = table.remove(deleteQ)
@@ -621,6 +641,7 @@ function M.update(gov, currentAnchor, player)
     gov:charge('roadDelete', now() - t0)
     sinceChange = stopwatch.new()
   end
+  rebuildCollision(gov, true)
   while #createQ > 0 and gov:try('roadChunk') do
     local q = table.remove(createQ, 1)
     local t = tiles[q.key]
@@ -665,20 +686,7 @@ function M.update(gov, currentAnchor, player)
     end
   end
   updateFar(gov)                -- far buildings: only with the near meshes all made (they share the budget)
-  if swapQuiet then
-    swapQuiet.frames = swapQuiet.frames - 1
-    if swapQuiet.frames <= 0 and swapQuiet.since() >= M.SWAP_QUIET_MS then swapQuiet = nil end
-  end
-  local urgent = collisionDirty and (holdActive or M.urgentColliders()) and sinceReload() > M.URGENT_GAP_S * 1000
-  if not swapQuiet and ((collisionDirty and sinceReload() > M.RELOAD_EVERY_S * 1000) or urgent
-      or (deletesDirty and sinceReload() > M.RELOAD_DELETES_S * 1000)) then
-    local t0 = now()
-    noteNewColliders()
-    be:reloadCollision()
-    lastReloadAt = now()
-    collisionDirty, deletesDirty, sinceReload = false, false, stopwatch.new()
-    gov:charge('roadWalk', now() - t0)
-  end
+  rebuildCollision(gov, false)
 end
 
 -- A colliding mesh (sidewalks, bridge decks) never turns solid around the player's car (2026-10-13: the
