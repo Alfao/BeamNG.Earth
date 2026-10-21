@@ -55,6 +55,8 @@ M.DELETE_NEAR_M = 200       -- a collider deleted this close to the player count
 -- FAST_MS the COLLIDE_LEAD_S reach is ahead of the car only (COLLIDE_M max), beside and behind it COLLIDE_M min;
 -- and a collider the car reaches within URGENT_S is made solid at once (URGENT_GAP_S between those rebuilds at most).
 M.FAST_MS = 25
+M.SIDE_PENALTY = 4          -- nextWalk at FAST_MS: m along the path a metre sideways counts as (server roads.py)
+M.LEAD_MAX_M = 2000         -- ... and what every tile behind the car comes after
 M.URGENT_S = 6
 M.URGENT_GAP_S = 1
 -- No be:reloadCollision for SWAP_QUIET_FRAMES frames and SWAP_QUIET_MS after a terrain .ter swap (M.terrainSwapped): the
@@ -69,6 +71,7 @@ local parked = {}          -- walkQ entries of colliders whose tile is not near 
 local sinceCollideCheck = stopwatch.new()
 local held = {}            -- walkQ entries of colliding meshes held while the player is in their boxes
 local noteNewColliders, playerIn, releaseHeld
+local prewarmId, prewarmPath, prewarmWant, prewarmNow
 local tiles = {}            -- key "a:tx_ty" -> { anchor, objs = { DecalRoad ids }, queued = n, walk = TSStatic id,
                             --   road = TSStatic id }
 local walkQ = {}            -- { key, walk = {shape, pos}, what = 'walk' | 'road' } FIFO
@@ -205,6 +208,20 @@ end
 
 local now = stopwatch.clock()
 
+-- Main-thread cost of each kind of unit (n, total ms, worst ms) since the level loaded: road chunks, deletes, each
+-- mesh kind of a road tile (road, walk, bld, bldcol, deck ...), far building tiles, collision reloads. status().units
+local unitStats = {}
+local unitLog = {}       -- the last UNIT_LOG units: { kind, ms, shape } (status().unitLog)
+M.UNIT_LOG = 400
+local function noteUnit(kind, ms, shape)
+  unitLog[#unitLog + 1] = { kind, ms, shape }
+  if #unitLog > M.UNIT_LOG then table.remove(unitLog, 1) end
+  local u = unitStats[kind]
+  if not u then u = { n = 0, ms = 0, max = 0 }; unitStats[kind] = u end
+  u.n, u.ms = u.n + 1, u.ms + ms
+  if ms > u.max then u.max = ms end
+end
+
 local function dropTile(key)
   local t = tiles[key]
   if not t then return end
@@ -215,9 +232,16 @@ local function dropTile(key)
   if t.deck then deleteQ[#deleteQ + 1] = t.deck end
   for _, w in ipairs({ 'bld', 'bld2', 'bld3', 'bld4', 'bldcol', 'walkcol', 'tunnel' }) do if t[w] then deleteQ[#deleteQ + 1] = t[w] end end
   if t.wire then deleteQ[#deleteQ + 1] = t.wire end
-  local keep = {}
-  for _, q in ipairs(parked) do if q.key ~= key then keep[#keep + 1] = q end end
-  parked = keep
+  -- and its meshes not made yet (from KyzoFox's 1.5.4, PR #64): a tile sent again under the same key left its old
+  -- walkQ / held / createQ entries, which were then made for the new tile from pooled shape paths that had just been
+  -- reported gone and refilled with another tile's shape: that tile's buildings drawn here at its ground height (houses
+  -- floating in the sky near Cleburne, AL, 2026-10-19)
+  local function purge(list)
+    local keep = {}
+    for _, q in ipairs(list) do if q.key ~= key then keep[#keep + 1] = q end end
+    return keep
+  end
+  parked, walkQ, held, createQ = purge(parked), purge(walkQ), purge(held), purge(createQ)
   if t.props then require('beamngEarth/trees').dropKey((key:gsub(':', ':p', 1))) end
   if t.park then require('beamngEarth/parking').dropKey(key) end
   tiles[key] = nil
@@ -376,7 +400,7 @@ function M.onTile(msg, currentAnchor)
     colliders = type(data.colliders) == 'table' and data.colliders or {}, slots = slots, at = now(), colWant = {} }
   sinceChange = stopwatch.new()
   if road then                -- the tile's road mesh replaces its DecalRoads (server/roadmesh.py)
-    walkQ[#walkQ + 1] = { key = key, walk = road, what = 'road' }
+    walkQ[#walkQ + 1] = { key = key, walk = road, what = 'road', tile = tiles[key] }
   else
     for _, c in ipairs(data.chunks) do createQ[#createQ + 1] = { key = key, chunk = c } end
   end
@@ -389,7 +413,7 @@ function M.onTile(msg, currentAnchor)
     tiles[key].park = true
   end
   if type(data.wire) == 'table' and data.wire.shape and type(data.wire.pos) == 'table' then    -- pole wires
-    walkQ[#walkQ + 1] = { key = key, walk = data.wire, what = 'wire' }
+    walkQ[#walkQ + 1] = { key = key, walk = data.wire, what = 'wire', tile = tiles[key] }
   end
   -- sidewalks, bridge decks, buildings (split in parts under the engine's 16-bit index limit), the buildings'
   -- lean collision mesh: colliders only near the car (M.COLLIDE_M); with a bldcol the drawn buildings only render
@@ -403,7 +427,7 @@ function M.onTile(msg, currentAnchor)
   for _, what in ipairs({ 'walk', 'deck', 'bld', 'bld2', 'bld3', 'bld4', 'bldcol', 'walkcol', 'tunnel' }) do
     local w = data[what]
     if type(w) == 'table' and w.shape and type(w.pos) == 'table' then
-      local q = { key = key, walk = w, what = what,
+      local q = { key = key, walk = w, what = what, tile = tiles[key],
         renderOnly = (lean and what:sub(1, 3) == 'bld' and what ~= 'bldcol') or (leanWalk and what == 'walk') }
       if not q.renderOnly then tiles[key].colWant[what] = true end
       if q.renderOnly or M.collideNear(tiles[key]) then walkQ[#walkQ + 1] = q else parked[#parked + 1] = q end
@@ -465,7 +489,9 @@ local function updateFar(gov)
       loadMaterials()
       local ok, id = pcall(createWalk, { shape = f.shape, pos = f.pos }, false)
       if ok then f.id = id; slotMade(id, f.shape) else lastError = tostring(id) end
-      gov:charge('roadWalk', now() - t0)
+      local ms = now() - t0
+      gov:charge('roadWalk', ms)
+      noteUnit('bldfar', ms, f.shape)
     end
   end
 end
@@ -612,15 +638,24 @@ local function rebuildCollision(gov, allowUrgent)
   if not swapQuiet and ((collisionDirty and sinceReload() >= M.RELOAD_EVERY_S * 1000) or urgent
       or (deletesDirty and sinceReload() >= M.RELOAD_DELETES_S * 1000))
       and gov:requestHeavy(allowUrgent and urgent or false) then
+    local t0 = now()
     noteNewColliders()
     be:reloadCollision()
     lastReloadAt = now()
     collisionDirty, deletesDirty, sinceReload = false, false, stopwatch.new()
+    noteUnit('reloadCollision', now() - t0)
   end
 end
 
 -- Once per frame (core onUpdate): deletions, then creations, within the governor's budget.
-function M.update(gov, currentAnchor, player)
+local viewAt = nil  -- core.viewAway(): the camera's { x, y } when it is away from the car, else nil (M.nextWalk)
+
+function M.update(gov, currentAnchor, player, view)
+  viewAt = view
+  if prewarmWant then prewarmNow()
+  elseif prewarmId and not scenetree.findObjectById(prewarmId) then   -- (the level loaded again: gone with it)
+    prewarmId, prewarmWant = nil, prewarmPath
+  end
   if currentAnchor then switchAnchor(currentAnchor) end
   releaseGhosts(player)
   if swapQuiet then
@@ -638,7 +673,9 @@ function M.update(gov, currentAnchor, player)
       o:delete()
     end
     slotObjGone(did)
-    gov:charge('roadDelete', now() - t0)
+    local ms = now() - t0
+    gov:charge('roadDelete', ms)
+    noteUnit('delete', ms)
     sinceChange = stopwatch.new()
   end
   rebuildCollision(gov, true)
@@ -651,7 +688,9 @@ function M.update(gov, currentAnchor, player)
       local ok, id = pcall(createChunk, q.chunk)
       if ok then t.objs[#t.objs + 1] = id else lastError = tostring(id) end
       t.queued = t.queued - 1
-      gov:charge('roadChunk', now() - t0)
+      local ms = now() - t0
+      gov:charge('roadChunk', ms)
+      noteUnit('chunk', ms)
       sinceChange = stopwatch.new()
     end
   end
@@ -660,10 +699,11 @@ function M.update(gov, currentAnchor, player)
   while #walkQ > 0 and gov:try('roadWalk') do
     local q = table.remove(walkQ, M.nextWalk(walkQ))
     local t = tiles[q.key]
+    if t and q.tile and q.tile ~= t then t = nil end   -- (an entry of an earlier tile under this key: not made)
     -- (only a colliding mesh waits: a render-only one (q.renderOnly: the drawn sidewalks and buildings beside their lean
     -- collision meshes) cannot catch the car, and holding it hid a whole tile's sidewalks while the car stood in their
     -- box: a roundabout's island band was never drawn, 2026-10-17 Harbor Point)
-    if t and q.what ~= 'road' and not q.renderOnly and playerIn(t.colliders[q.what]) then
+    if t and q.what ~= 'road' and not q.renderOnly and playerIn(t.colliders[q.what], q.what) then
       held[#held + 1] = q           -- the car is on it: made once the car is clear (playerIn)
       t = nil
     end
@@ -681,7 +721,9 @@ function M.update(gov, currentAnchor, player)
           t.colAt = t.colAt or {}; t.colAt[q.what] = now()
         end
       else lastError = tostring(id) end
-      gov:charge('roadWalk', now() - t0)
+      local ms = now() - t0
+      gov:charge('roadWalk', ms)
+      noteUnit(tostring(q.what), ms, q.walk and q.walk.shape)
       sinceChange = stopwatch.new()
     end
   end
@@ -695,6 +737,9 @@ end
 -- the last reloadCollision, is removed again before it, and made once the car is clear.
 M.PLAYER_R = 3.0    -- m around the player's position (half a car's length, and some)
 M.PLAYER_DZ = 2.5   -- m above / below
+M.DECK_BOX_BELOW_M = 2.2    -- a deck box's floor is this far under its lowest surface (server roads.collider_boxes:
+                            -- roadmesh.DECK_DEPTH 1.2 + 1.0)
+M.DECK_ON_M = 0.2           -- the car's position this far under that surface or less: on the deck (not held)
 
 -- Is world position p within r m (horizontally) of the player's car? (no car: yes, to be safe)
 function M.nearPlayer(p, r)
@@ -705,7 +750,7 @@ function M.nearPlayer(p, r)
   return dx * dx + dy * dy <= r * r
 end
 
-playerIn = function(boxes)
+playerIn = function(boxes, what)
   -- (a drop hold: the car does not move until its ground and colliders are in, then it is set on top of them)
   if holdActive or type(boxes) ~= 'table' or #boxes == 0 then return false end
   local veh = getPlayerVehicle and getPlayerVehicle(0)
@@ -713,9 +758,16 @@ playerIn = function(boxes)
   local p = veh:getPosition()
   local r, dz = M.PLAYER_R, M.PLAYER_DZ
   for _, b in ipairs(boxes) do
-    if p.x >= b[1] - r and p.x <= b[4] + r and p.y >= b[2] - r and p.y <= b[5] + r
-        and p.z >= b[3] - dz and p.z <= b[6] + dz then
-      return true
+    if p.x >= b[1] - r and p.x <= b[4] + r and p.y >= b[2] - r and p.y <= b[5] + r then
+      if what == 'deck' then
+        -- a deck: only with the car under its surface (in its slab, or under it within a car's height): driving up
+        -- onto a late deck the car was always in its box, the deck held until the car was past, and the car fell
+        -- through it (I-95, Baltimore, a Deck test drive 2026-10-20)
+        local surf = b[3] + M.DECK_BOX_BELOW_M
+        if p.z < surf - M.DECK_ON_M and p.z > surf - M.DECK_BOX_BELOW_M - dz then return true end
+      elseif p.z >= b[3] - dz and p.z <= b[6] + dz then
+        return true
+      end
     end
   end
   return false
@@ -727,7 +779,7 @@ releaseHeld = function()
   for _, q in ipairs(held) do
     local t = tiles[q.key]
     if t then
-      if playerIn(t.colliders[q.what]) then keep[#keep + 1] = q else walkQ[#walkQ + 1] = q end
+      if playerIn(t.colliders[q.what], q.what) then keep[#keep + 1] = q else walkQ[#walkQ + 1] = q end
     end
   end
   held = keep
@@ -738,7 +790,7 @@ noteNewColliders = function()
   for _, c in ipairs(newColliders) do
     local q = c[2]
     local t = tiles[q.key]
-    if t and t[q.what] == c[1] and playerIn(t.colliders[q.what]) then
+    if t and t[q.what] == c[1] and playerIn(t.colliders[q.what], q.what) then
       local o = scenetree.findObjectById(c[1])
       if o then o:delete() end
       t[q.what] = nil
@@ -762,7 +814,8 @@ end
 
 -- Which walkQ entry to make next (index): the road meshes and colliders before the render-only meshes (drawn
 -- buildings, wires), each by the distance to its tile's centre (behind a fast car counting three times): the tiles
--- the car reaches first (the user, 2026-10-19: high speeds, the road texture struggling to keep up).
+-- the car reaches first (the user, 2026-10-19: high speeds, the road texture struggling to keep up). A render-only
+-- mesh by its distance to the camera instead when that is nearer (viewAt: what is drawn follows the camera).
 function M.nextWalk(q)
   if #q <= 1 then return 1 end
   local p, dir = playerNow()
@@ -774,7 +827,16 @@ function M.nextWalk(q)
     if t and t.cx then
       local dx, dy = t.cx - p.x, t.cy - p.y
       k = math.sqrt(dx * dx + dy * dy)
-      if dir and dx * dir.x + dy * dir.y < -M.TILE_M then k = k * 3 end
+      if dir then         -- fast: by the way along the path ahead, sideways counting SIDE_PENALTY times (the server's
+        local along = dx * dir.x + dy * dir.y               -- roads.path_key); behind the car after all of those
+        local side = math.abs(dx * dir.y - dy * dir.x)
+        if along < -M.TILE_M then k = k * 3 + M.LEAD_MAX_M
+        else k = math.max(0, along) + M.SIDE_PENALTY * math.max(0, side - M.TILE_M / 2) end
+      end
+      if viewAt and (e.renderOnly or e.what == 'wire') then
+        local vx, vy = t.cx - viewAt.x, t.cy - viewAt.y
+        k = math.min(k, math.sqrt(vx * vx + vy * vy))
+      end
     end
     if e.renderOnly or e.what == 'wire' then k = k + 1e6 end
     if k < bestKey then best, bestKey = i, k end
@@ -847,6 +909,35 @@ function M.collisionRebuilt()
 end
 
 -- Every road removed now (setting off, mod unload).
+-- Server hello.prewarm: a tiny shape listing every material the server's shapes use, loaded once when it connects
+-- (server/prewarm.py): a material's first shape in a session set it up (a tunnel's first tile 65 ms, later ones ~2 ms),
+-- now while the level starts. Kept far below the map (one per path; nil: an older server, nothing).
+prewarmNow = function()
+  local path = prewarmWant
+  -- (the hello comes at the main menu, before the level's objects and with the roads off outside our level)
+  if not path or not M.enabled or not scenetree.MissionGroup then return end
+  prewarmWant = nil
+  if path == prewarmPath and prewarmId and scenetree.findObjectById(prewarmId) then return end   -- (made already)
+  if prewarmId then
+    local o = scenetree.findObjectById(prewarmId)
+    if o then o:delete() end
+    prewarmId = nil
+  end
+  loadMaterials()
+  local t = stopwatch.new()
+  local ok, id = pcall(createWalk, { shape = path, pos = { 0, 0, -5000 } }, false)
+  if not ok then lastError = tostring(id); return end
+  prewarmId, prewarmPath = id, path
+  log('I', 'beamngEarth', string.format('roads: materials prewarmed in %.0f ms (%s)', t(), path))
+end
+
+function M.prewarm(path)
+  if type(path) ~= 'string' then return false end
+  prewarmWant = path
+  prewarmNow()
+  return true
+end
+
 function M.clear()
   for key in pairs(tiles) do dropTile(key) end
   for _, f in pairs(far) do
@@ -903,6 +994,8 @@ function M.ahead(x, y, hx, hy, dist)
       local e = { d = d, key = sq, arrived = t and math.floor(tnow - (t.at or tnow)) or false }
       if t then
         e.road = t.road ~= nil or (t.queued or 0) <= 0
+        e.bld = t.bld ~= nil                    -- (a tile without buildings never has one)
+        e.walk = t.walk ~= nil
         local want, made, solid = 0, 0, 0
         for what in pairs(t.colWant or {}) do
           want = want + 1
@@ -932,7 +1025,7 @@ function M.status()
   for _, f in pairs(far) do if f.id and not f.hidden then nf = nf + 1 end end
   return { enabled = M.enabled, tiles = nt, roads = no, queued = #createQ, deleting = #deleteQ, anchor = anchorId,
     walks = nw, roadMeshes = nr, decks = nd, buildings = nb, farBuildings = nf, walksQueued = #walkQ, solidAround = M.solidAround or 0,
-    quietS = sinceChange() / 1000, error = lastError }
+    quietS = sinceChange() / 1000, error = lastError, units = unitStats, unitLog = unitLog }
 end
 
 local okSweep, swept = pcall(M.sweep)

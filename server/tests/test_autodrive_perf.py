@@ -93,6 +93,16 @@ class ProcSamplerTest(unittest.TestCase):
         }):
             self.assertEqual(sampler.groups(), {"server": [4], "game": [5]})
 
+    def test_appimage_server_and_workers_are_discovered_outside_named_project(self):
+        sampler, _, _ = self.sampler({})
+        sampler.windows = None
+        with patch.object(ad, "_procs", return_value={
+            4: (1, "/tmp/.mount_earth/app.AppImage --server --port 19001"),
+            5: (4, "python3 --multiprocessing-fork"),
+            6: (1, "/tmp/.mount_earth/app.AppImage"),
+        }):
+            self.assertEqual(sampler.groups(), {"server": [4, 5], "game": []})
+
     def test_cpu_is_one_core_percent_and_unavailable_until_a_second_sample(self):
         sampler, reader, _ = self.sampler({2: (1, "earthd.py")})
         reader.cpu_rss.side_effect = [(10.0, 100.2), (None, None), (12.5, 102.6), (None, None)]
@@ -111,6 +121,12 @@ class ProcSamplerTest(unittest.TestCase):
             samples = [sampler.sample()["server"] for _ in range(5)]
         self.assertEqual([s["cpu"] for s in samples], [None, None, None, None, 100.0])
         self.assertIsNone(samples[2]["rssMB"])
+
+    def test_cpu_summary_keeps_available_samples_after_a_process_read_fails(self):
+        rows = [{"procs": {"server": {"cpu": 100, "rssMB": 123}, "game": {"cpu": 50, "rssMB": None}}},
+                {"procs": {"server": {"cpu": None, "rssMB": None}}}, {"procs": None}]
+        self.assertEqual(ad._cpu(rows), {"server": {"avg": 1.0, "max": 1.0, "rssMB": 123},
+                                        "game": {"avg": 0.5, "max": 0.5, "rssMB": None}})
 
 
 class WindowsDiscoveryTest(unittest.TestCase):

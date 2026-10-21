@@ -166,6 +166,33 @@ for _, g in ipairs(gone) do got[g[1]] = g[2] end
 T.check(#gone == 2 and got[12] == 40 and got[13] == 41, 'objects deleted: both slots reported with their serials')
 T.check(#roads.takeSlotsGone('other') == 0, 'reports are per server session')
 
+-- (from PR #64, KyzoFox 1.5.4) a tile sent again under the same key before its meshes were made: the old tile's queued meshes
+-- (their slot paths already reported gone, so the server may have given them to another tile) are not made into the
+-- new tile (houses floating near Cleburne, AL: another tile's buildings at this tile's place, 2026-10-19)
+for _, o in ipairs(statics()) do o:delete() end
+roads.takeSlotsGone('sA')
+gov.allow, gov.tries = 0, 0                 -- no mesh made this frame
+roads.onTile({ anchorId = 2, key = '6_8', path = '/t/wc.json', n = 0, slots = {
+  walk = { '/temp/beamngEarth/sA/slot_00020.cdae', 50 }, walkcol = { '/temp/beamngEarth/sA/slot_00021.cdae', 51 } } }, 2)
+roads.update(gov, 2)
+T.check(#statics() == 0, 'resend: nothing made yet')
+roads.onTile({ anchorId = 2, key = '6_8', path = '/t/wc.json', n = 0, slots = {
+  walk = { '/temp/beamngEarth/sA/slot_00030.cdae', 60 }, walkcol = { '/temp/beamngEarth/sA/slot_00031.cdae', 61 } } }, 2)
+gone = roads.takeSlotsGone('sA')
+T.check(#gone == 2, 'resend: the first copy\'s slots reported gone (never loaded)')
+gov.allow, gov.tries = nil, 0
+roads.update(gov, 2); roads.update(gov, 2)
+shapes = {}
+for _, o in ipairs(statics()) do shapes[o.fields.shapeName] = (shapes[o.fields.shapeName] or 0) + 1 end
+T.check(not shapes['/temp/beamngEarth/sA/slot_00020.cdae'] and not shapes['/temp/beamngEarth/sA/slot_00021.cdae'],
+  'resend: the reported slots are never loaded')
+T.check(shapes['/temp/beamngEarth/sA/slot_00030.cdae'] == 1 and shapes['/temp/beamngEarth/sA/slot_00031.cdae'] == 1
+  and #statics() == 2, 'resend: the new copy\'s meshes made once each')
+roads.onDrop({ anchorId = 2, key = '6_8' })
+roads.update(gov, 2)
+T.check(#statics() == 0, 'resend: every mesh goes with the tile (none orphaned)')
+roads.takeSlotsGone('sA')
+
 -- a sidewalk mesh never turns solid around the player's car: held while the car is in its boxes
 files['/t/h.json'] = '{ chunks = { }, walk = { shape = "/t/walks_2_7_7.cdae", pos = { 0, 0, 0 } }, ' ..
   'colliders = { walk = { { 100, 100, 0, 120, 110, 1 } } } }'
@@ -195,6 +222,25 @@ car.pos = vec3(200, 105, 0.5)
 roads.update(gov, 2)
 T.check(#statics() == 1, 'made again once clear')
 roads.RELOAD_EVERY_S = 0
+roads.onDrop({ anchorId = 2, key = '0_0' })
+roads.update(gov, 2)
+-- a deck is held only with the car under its surface: a car on the approach at the deck's height (in its box) gets
+-- it at once (held, a late deck stayed out until the car was past and the car fell through it, 2026-10-20)
+files['/t/d.json'] = '{ chunks = { }, deck = { shape = "/t/deck_2_9_9.cdae", pos = { 0, 0, 0 } }, ' ..
+  'colliders = { deck = { { 100, 100, 7.8, 120, 110, 12 } } } }'      -- (surface 10 m: 10 - 2.2 .. 10 + 2)
+car.pos = vec3(110, 105, 10.5)
+roads.onTile({ anchorId = 2, key = '0_0', path = '/t/d.json', n = 0 }, 2)
+roads.update(gov, 2)
+T.check(#statics() == 1, 'a deck made with the car driving onto it')
+roads.onDrop({ anchorId = 2, key = '0_0' })
+roads.update(gov, 2)
+car.pos = vec3(110, 105, 9.0)          -- in its slab
+roads.onTile({ anchorId = 2, key = '0_0', path = '/t/d.json', n = 0 }, 2)
+roads.update(gov, 2)
+T.check(#statics() == 0, 'held with the car in its slab')
+car.pos = vec3(200, 105, 0.5)
+roads.update(gov, 2)
+T.check(#statics() == 1, 'made once the car is clear')
 roads.onDrop({ anchorId = 2, key = '0_0' })
 roads.update(gov, 2)
 -- with a lean collision mesh the drawn sidewalk is render-only: made with the car in its box (it cannot catch the car;
@@ -233,6 +279,26 @@ T.check(roads.collideRadius(0) == roads.COLLIDE_M[1] and roads.collideRadius(45)
   and roads.collideRadius(500) == roads.COLLIDE_M[2], 'the radius grows with speed, within its limits')
 roads.onDrop({ anchorId = 2, key = '9_0' })
 roads.update(gov, 2)
+-- a fast car: the road pieces along its path first (a tile 512 m ahead before one 512 m beside it), the ones behind
+-- it last; standing, by distance (the user, 2026-10-19: at 100+ mph the road texture went first)
+do
+  files['/t/e.json'] = '{ chunks = { } }'
+  for _, k in ipairs({ '2_0', '0_1', '0_2', '-2_0' }) do roads.onTile({ anchorId = 2, key = k, path = '/t/e.json', n = 0 }, 2) end
+  car.pos = vec3(128, 128, 0.5)
+  function car:getVelocity() return vec3(45, 0, 0) end
+  roads.update(gov, 2)              -- (the motion read: updateCollideRange)
+  local q = { { key = '2:0_2' }, { key = '2:-2_0' }, { key = '2:2_0' } }
+  T.check(q[roads.nextWalk(q)].key == '2:2_0', 'fast: the tile ahead on the path first')
+  table.remove(q, 3)
+  T.check(q[roads.nextWalk(q)].key == '2:0_2', 'then beside, behind last')
+  function car:getVelocity() return vec3(0, 0, 0) end
+  roads.update(gov, 2)
+  q = { { key = '2:2_0' }, { key = '2:0_1' } }
+  T.check(q[roads.nextWalk(q)].key == '2:0_1', 'standing: the nearer tile first')
+  for _, k in ipairs({ '2_0', '0_1', '0_2', '-2_0' }) do roads.onDrop({ anchorId = 2, key = k }) end
+  roads.update(gov, 2)
+  car.getVelocity = nil
+end
 getPlayerVehicle = nil
 
 -- a road mesh: the tile's DecalRoads are not made; one TSStatic without collision instead
@@ -297,6 +363,44 @@ do
   T.check(roads.radiusToward(p, -100, 50, 1400, east) == 1400, 'its own tile: the full reach')
   T.check(roads.radiusToward(p, -1500, 0, 1400, nil) == 1400, 'slow (no direction): all round')
   T.check(roads.collideRadius(100) == 1400 and roads.collideRadius(500) == roads.COLLIDE_M[2], 'reach: 14 s of driving, capped')
+end
+
+-- A distant free camera prioritizes render-only scenery, while collider imports still follow the car.
+do
+  local car = { getPosition = function() return vec3(128, 128, 0) end }
+  getPlayerVehicle = function() return car end
+  files['/t/empty.json'] = '{ chunks = {} }'
+  for _, k in ipairs({ '1_0', '10_0' }) do roads.onTile({ anchorId = 2, key = k, path = '/t/empty.json' }, 2) end
+  roads.update(gov, 2, nil, { x = 2688, y = 128 })
+  local q = { { key = '2:1_0', renderOnly = true }, { key = '2:10_0', renderOnly = true } }
+  T.check(roads.nextWalk(q) == 2, 'camera: scenery at the distant camera is prioritized')
+  q[1].renderOnly, q[2].renderOnly = false, false
+  T.check(roads.nextWalk(q) == 1, 'camera: collision imports still prioritize the car')
+  for _, k in ipairs({ '1_0', '10_0' }) do roads.onDrop({ anchorId = 2, key = k }) end
+  getPlayerVehicle = nil
+end
+
+-- A hello at the main menu defers prewarming until level objects exist, and a later level
+-- recreates the prewarm shape after the previous level took its objects away.
+do
+  local mission = scenetree.MissionGroup
+  scenetree.MissionGroup = nil
+  T.check(not roads.prewarm(nil), 'prewarm: an older server without a path is accepted')
+  T.check(roads.prewarm('/t/prewarm.cdae') and #statics() == 0, 'prewarm: a menu hello waits for the level')
+  scenetree.MissionGroup = mission
+  local reloads = S.calls.reloadCollision or 0
+  roads.update(gov, 2)
+  local warm = statics()[1]
+  T.check(#statics() == 1 and warm.fields.shapeName == '/t/prewarm.cdae'
+    and warm.fields.collisionType == 'None' and warm.pos.z == -5000 and (S.calls.reloadCollision or 0) == reloads,
+    'prewarm: first level update loads one render-only shape far below the map')
+  roads.prewarm('/t/prewarm.cdae')
+  T.check(#statics() == 1 and statics()[1].id == warm.id, 'prewarm: repeated hello reuses the loaded shape')
+  warm:delete()
+  roads.update(gov, 2)
+  roads.update(gov, 2)
+  T.check(#statics() == 1 and statics()[1].id ~= warm.id and statics()[1].fields.shapeName == '/t/prewarm.cdae',
+    'prewarm: a new level recreates the shape removed with the old level')
 end
 
 T.done('test_roads')

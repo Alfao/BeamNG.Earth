@@ -55,6 +55,23 @@ class UnderpassTopology(unittest.TestCase):
 
 
 class CollisionProfile(unittest.TestCase):
+    def test_surface_crossing_preserves_portal_cap_limit(self):
+        from test_roads import features, FRAME
+        f = features([[(-20, 0), (20, 0)], [(-16, -100), (-16, 100)]],
+                     ["residential", "motorway"], widths=[(1, 7.0)], flags=[(0, "is_tunnel")])
+
+        def elev(lat, lon):
+            e, _n, _u = FRAME.geodetic_to_enu(lat, lon, 0.0)
+            return 100.0 + np.where(np.abs(e) < 18.0, 6.0, 0.0)
+
+        tunnel = roads.TunnelProfiles(FRAME, lambda key: f, elev)
+        chunks = [c for c in roads._tunnel_chunks(tunnel, [f], (-128.0, -128.0, 128.0, 128.0))
+                  if c.get("tunnel")]
+        self.assertTrue(chunks)
+        self.assertFalse(chunks[0]["arch_cap"], "the upper road supplies this mapped crossing's cover")
+        self.assertLess(chunks[0]["cap_m"][0], roadmesh.LOW_CAP_M,
+                        "the portal's stone top still stops before the upper carriageway")
+
     def test_tube_height_fits_the_final_upper_road(self):
         from test_roads import features, FRAME
         f = features([[(0, -140), (0, 140)], [(-60, 0), (60, 0)]],

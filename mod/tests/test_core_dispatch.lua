@@ -25,7 +25,7 @@ end
 scenetree.MissionGroup = nil -- update stops after dispatch; no level/world rendering is needed
 local function frame() core.onUpdate(0.016, 0.016) end
 local st = core._state()
-st.anchorId, st.sessionId = 11, 'old'
+st.inOurLevel, st.anchorId, st.sessionId = true, 11, 'old'
 incoming = { { type = 'roads_tile', id = 1 }, { type = 'roads_tile', id = 2, fail = true },
   { type = 'roads_tile', id = 3 }, { type = '_disconnected', error = 'closed by server' } }
 frame()
@@ -38,7 +38,7 @@ core.onClientEndMission()
 T.check(core._state().messages == stats and stats.queued == 2, 'level reset retains the continuous connection FIFO and diagnostics')
 frame()
 T.check(polls == 1 and #seen == 3 and core._state().sessionId == nil and stats.queued == 0,
-  'the pending final tile precedes disconnect after a level reset, without another poll')
+  'the menu drains the pending final tile before disconnect after a level reset, without another poll')
 T.check(seen[3].anchor == nil, 'deferred tile sees the reset anchor rather than reviving its old level anchor')
 
 st = core._state()

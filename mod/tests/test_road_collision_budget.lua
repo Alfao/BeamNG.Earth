@@ -74,6 +74,8 @@ do
   end
   T.check(roads.status().roadMeshes == 1, 'queued road imports resume after the heavy slot')
   T.near(g.est.roadWalk, 3, 1e-9, 'the 56 ms rebuild does not inflate the 3 ms mesh-import estimate')
+  local unit = roads.status().units.reloadCollision
+  T.check(unit and unit.n == 1 and unit.ms == 56, 'isolated rebuilds retain the upstream collision cost diagnostics')
 end
 
 -- An urgent collider made this frame is rebuilt at the start of the next frame; no more meshes

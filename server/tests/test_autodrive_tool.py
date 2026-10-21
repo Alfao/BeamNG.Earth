@@ -114,6 +114,52 @@ class HitchTest(unittest.TestCase):
 
 
 class TargetSpeedTest(unittest.TestCase):
+    def test_speed_options_cannot_override_each_other(self):
+        with patch.object(sys, "argv", ["autodrive_perf.py", "--to", "49,12", "--out", "unused",
+                                        "--target-kmh", "200", "--ai-mph", "100"]), \
+                patch.object(ad, "lua") as lua, patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit) as error:
+                ad.main()
+        self.assertEqual(error.exception.code, 2)
+        lua.assert_not_called()
+
+    def test_delayed_mph_switch_retains_telemetry_and_cleanup(self):
+        clock, calls, polls = [0.0], [], [0]
+
+        def lua(code):
+            calls.append(code)
+            if code == ad.ROAD_LIMIT_LUA:
+                return str(100 / 3.6)
+            if code == ad.LUA_POLL:
+                polls[0] += 1
+                row = poll(float(polls[0]))
+                row["perf"] = {"frames": 60, "avgMs": 16.7, "maxMs": 16.7}
+                row["gps"]["autodrive"] = polls[0] < 3
+                row["lead"] = {"road": 150, "arrived": 500}
+                return json.dumps(row)
+            return "ok"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(sys, "argv", ["autodrive_perf.py", "--to", "49,12", "--out", tmp,
+                                            "--minutes", "0.1", "--ai-mph", "100", "--fast-after", "1"]), \
+                    patch.object(ad, "lua", side_effect=lua), patch.object(ad.mcp, "quiet_ui"), \
+                    patch.object(ad, "ProcSampler", return_value=Mock(sample=Mock(return_value={}))), \
+                    patch.object(ad.time, "time", side_effect=lambda: clock[0]), \
+                    patch.object(ad.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)), \
+                    patch("sys.stdout", new_callable=io.StringIO):
+                ad.main()
+            with open(os.path.join(tmp, "summary.json")) as f:
+                summary = json.load(f)
+        self.assertIn("speedOverride = nil", calls[0])
+        switches = [code for code in calls if 'ai.setSpeedMode' in code]
+        self.assertEqual(len(switches), 1)
+        self.assertIn(repr(100 * 0.44704), switches[0])
+        self.assertIn("speedOverride = nil", calls[-1])
+        self.assertIn("uiGpsAutodrive(false)", calls[-1])
+        self.assertEqual(summary["endReason"], "autodrive_ended")
+        self.assertEqual(summary["lead"]["road_median_m"], 150)
+        self.assertEqual(summary["lead"]["road_under_200m_s"], 2)
+
     def test_invalid_target_is_rejected_before_game_calls(self):
         for value in ("0", "-1", "nan", "inf", "-inf", "bad"):
             with self.subTest(value=value), \
@@ -235,12 +281,15 @@ class LifecycleTest(unittest.TestCase):
         import builtins
         from types import SimpleNamespace
 
-        for stage in (None, "activation", "recorder_start", "events.jsonl", "samples.jsonl", "recorder_stop", "disable"):
+        for stage in (None, "speed_setup", "activation", "recorder_start", "events.jsonl", "samples.jsonl",
+                      "recorder_stop", "disable"):
             with self.subTest(stage=stage), tempfile.TemporaryDirectory() as tmp:
                 calls, event_files = [], []
 
                 def lua(code):
                     calls.append(code)
+                    if stage == "speed_setup" and "speedOverride" in code and "uiGpsAutodrive(false)" not in code:
+                        raise RuntimeError(stage)
                     if stage == "activation" and "uiGpsAutodrive(true)" in code:
                         raise RuntimeError(stage)
                     if stage == "disable" and "uiGpsAutodrive(false)" in code:
